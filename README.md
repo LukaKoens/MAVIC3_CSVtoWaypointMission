@@ -4,3 +4,4 @@ The Mavic 3 only supports internal way point missions. so third party apps canno
 
 Not being able to create a waypoint mission directly means any planned flight is being swapped into an existing mission, and can't be created specifically. 
 
+By using the same few missions they can be named in the app and referenced more easily
