@@ -60,7 +60,6 @@ from xml.dom import minidom
 from pathlib import Path
 from datetime import datetime, timezone
 
-from History.MissionCreation.Source.NEW_ConvertCSVtoKMZ import _pretty
 from zipfile import ZipFile, ZIP_DEFLATED
 
 
@@ -225,22 +224,26 @@ def add_placemark(folder, row, index):
     heading_angle = -90 if ((index - 1) // 2) % 2 == 0 else 90    
     if str(index) == "0":
         heading_angle = -90
-    # Heading
-    
+
+    ##### ------ Heading
     heading = _sub(pm, "waypointHeadingParam", ns=WPML_NS)
-    _sub(heading, "waypointHeadingMode", "smoothTransition", ns=WPML_NS)
+    _sub(heading, "waypointHeadingMode", "followWayline", ns=WPML_NS)           ## This means the specific heading isn't needed and the drone won't do sick 360's in the main lengths
     _sub(heading, "waypointHeadingAngle", str(heading_angle), ns=WPML_NS)
     _sub(heading, "waypointPoiPoint", "0.000000,0.000000,0.000000", ns=WPML_NS)
     _sub(heading, "waypointHeadingAngleEnable", "1" if str(index) == "0" else "0", ns=WPML_NS)
     _sub(heading, "waypointHeadingPathMode", "followBadArc", ns=WPML_NS)
-
-    # Turn
+    _sub(heading, "waypointHeadingPoiIndex", "0", ns=WPML_NS)
+    
+    ##### ------ Turn
     turn = _sub(pm, "waypointTurnParam", ns=WPML_NS)
     _sub(turn, "waypointTurnMode", "toPointAndStopWithContinuityCurvature" if str(index) == "0" else "toPointAndPassWithContinuityCurvature", ns=WPML_NS)
     _sub(turn, "waypointTurnDampingDist", "0", ns=WPML_NS)
 
     _sub(pm, "useStraightLine", "0", ns=WPML_NS)
 
+    ###### ------ Gimbal
+
+    ###### ------ Action Group 1 (first waypoint only)    
     if str(index) == "0":
         ag0 = _sub(pm, "actionGroup", ns=WPML_NS)
         _sub(ag0, "actionGroupId", "1", ns=WPML_NS)
@@ -269,11 +272,11 @@ def add_placemark(folder, row, index):
         _sub(params, "gimbalRotateTime", "0", ns=WPML_NS)
         _sub(params, "payloadPositionIndex", "0", ns=WPML_NS)
 
-    # Action Group 1
+    ##### ------ Action Group 1
     ag1 = _sub(pm, "actionGroup", ns=WPML_NS)
     _sub(ag1, "actionGroupId", "2", ns=WPML_NS)
     _sub(ag1, "actionGroupStartIndex", str(index), ns=WPML_NS)
-    _sub(ag1, "actionGroupEndIndex", str(index), ns=WPML_NS)
+    _sub(ag1, "actionGroupEndIndex", str(index+1), ns=WPML_NS)
     _sub(ag1, "actionGroupMode", "parallel", ns=WPML_NS)
 
     trigger = _sub(ag1, "actionTrigger", ns=WPML_NS)
@@ -285,7 +288,13 @@ def add_placemark(folder, row, index):
 
     params = _sub(action, "actionActuatorFuncParam", ns=WPML_NS)
     _sub(params, "gimbalPitchRotateAngle", "-90", ns=WPML_NS)
+    _sub(params, "gimbalRollRotateAngle", "0", ns=WPML_NS)
     _sub(params, "payloadPositionIndex", "0", ns=WPML_NS)
+    
+    gimbalHeading = _sub(ag1, "waypointGimbalHeadingParam", ns=WPML_NS)
+    _sub(gimbalHeading, "waypointGimbalPitchAngle", "0", ns=WPML_NS)
+    _sub(gimbalHeading, "waypointGimbalYawAngle", "0", ns=WPML_NS)
+    
     ACTION_COUNT += 1
 
 
