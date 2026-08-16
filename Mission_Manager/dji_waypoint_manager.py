@@ -110,6 +110,7 @@ MISSION_META_DEFAULTS = {
     "flight_number": "",
     "label": "",
     "notes": "",
+    "source_csv": "",  # path to the CSV that generated this mission (local only)
     "mission_file_dirty": False,   # True = local edit not yet pushed to phone
     "thumbnail_dirty": False,
 }
@@ -347,7 +348,6 @@ def scan_missions(local_root: Path, cfg: dict) -> list:
 
     missions = []
     for d in sorted(local_root.iterdir()):
-        print(d)
         if not d.is_dir() or d.name == map_preview_name:
             continue
 
@@ -577,7 +577,10 @@ class App(tk.Tk):
         self.thumb_file_var = tk.StringVar()
         self.mission_marker_var = tk.StringVar()
         self.thumb_marker_var = tk.StringVar()
+        self.source_file_var = tk.StringVar()
 
+
+        ### Mission file row and actions
         ttk.Label(files_frame, text="Mission file:").grid(row=0, column=0, sticky=tk.W, padx=4, pady=2)
         ttk.Label(files_frame, textvariable=self.mission_file_var, foreground="#333").grid(
             row=0, column=1, sticky=tk.W, padx=4, pady=2)
@@ -589,7 +592,13 @@ class App(tk.Tk):
         #            command=lambda: self.replace_file("mission")).grid(row=0, column=3, padx=3)
         ttk.Button(files_frame, text="Reveal",
                    command=lambda: self.reveal_file("mission")).grid(row=0, column=5, padx=3)
+        
+        ### ----- Display Mission file Source
+        ttk.Label(files_frame, text="CSV Mission file:").grid(row=2, column=0, sticky=tk.W, padx=4, pady=2)
+        ttk.Label(files_frame, textvariable=self.source_file_var, foreground="#333").grid(
+            row=2, column=1, sticky=tk.W, padx=4, pady=2)
 
+        ### Thumbnail row and actions
         ttk.Label(files_frame, text="Thumbnail:").grid(row=1, column=0, sticky=tk.W, padx=4, pady=2)
         ttk.Label(files_frame, textvariable=self.thumb_file_var, foreground="#333").grid(
             row=1, column=1, sticky=tk.W, padx=4, pady=2)
@@ -599,6 +608,9 @@ class App(tk.Tk):
                    command=lambda: self.replace_file("thumbnail")).grid(row=1, column=3, padx=3)
         ttk.Button(files_frame, text="Reveal",
                    command=lambda: self.reveal_file("thumbnail")).grid(row=1, column=5, padx=3)
+
+
+
 
         meta_frame = ttk.LabelFrame(right, text="Your tracking info (local only - never pushed to phone)")
         meta_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -708,6 +720,7 @@ class App(tk.Tk):
         self.thumb_file_var.set(m.thumbnail_file.name if m.thumbnail_file else "(none found)")
         self.mission_marker_var.set("needs push" if m.meta.get("mission_file_dirty") else "")
         self.thumb_marker_var.set("needs push" if m.meta.get("thumbnail_dirty") else "")
+        self.source_file_var.set(m.meta.get("source_csv") or "(none)")
 
         self.flight_entry.delete(0, tk.END)
         self.flight_entry.insert(0, m.meta.get("flight_number") or "")
@@ -790,6 +803,7 @@ class App(tk.Tk):
             return
 
         m.meta["mission_file_dirty"] = True
+        m.meta["source_csv"] = str(source_path)
         try:
             m.save_meta()
         except OSError as exc:
