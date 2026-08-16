@@ -12,3 +12,9 @@ By using the same few missions they can be named in the app and referenced more 
 # Further Development steps
 - Develop the tools or understanding to allow for incorporating DEM information to have terrain following ability, however this will require considerations to ensure there aren't safety issues introduced
 - Develop a better tool / process for sending the resulting waypoint missions to my phone and helping to work around the difficulty that DJI fly introduces to the process
+
+
+# DJI Waypoint Mission Manager
+
+A small Tkinter GUI for tracking and annotating DJI Fly waypoint missions,
+without renaming or creating any file that DJI Fly itself needs to own.

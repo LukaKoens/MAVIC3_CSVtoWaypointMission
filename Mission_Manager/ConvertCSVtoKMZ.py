@@ -394,6 +394,23 @@ def build_kmz(rows: list[dict], output_path: str, args) -> None:
     print(f"   Finish    : {args.finish}")
     print(f"   RC lost   : {args.lost}")
 
+def build_kmz_from_csv(input_path: str, output_path: str) -> None:
+    args = argparse.Namespace(
+        input=input_path,
+        output=output_path,
+        speed=5.0,
+        altitude=None,
+        finish="goHome",
+        lost="goContinue",
+        takeoff_h=30.0,
+        no_photo=False,
+    )
+
+    # Apply the same speed clamp used by parse_args()
+    args.speed = _clamp(args.speed, 0.1, MAX_SPEED_MS)
+    rows = read_geoflight_csv(input_path)
+    build_kmz(rows, output_path, args)
+
 
 def main(argv=None):
     args = parse_args(argv)
