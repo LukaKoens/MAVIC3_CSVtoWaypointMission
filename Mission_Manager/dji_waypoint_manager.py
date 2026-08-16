@@ -68,6 +68,11 @@ from typing import Optional
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+import zipfile
+import xml.etree.ElementTree as ET
+from tkintermapview import TkinterMapView
+
+import glob
 from ConvertCSVtoKMZ import build_kmz_from_csv
 
 try:
@@ -136,121 +141,126 @@ def save_config(cfg: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
 
-
 # --------------------------------------------------------------------------
-# adb helpers
+# MTP (gvfs) helpers — alternative to adb, no USB debugging required
 # --------------------------------------------------------------------------
 
-def get_adb_path() -> Optional[str]:
-    return shutil.which("adb")
+def _gvfs_root() -> Optional[Path]:
+    """Finds the gvfs mount directory for the current user session."""
+    uid = os.getuid()
+    base = Path(f"/run/user/{uid}/gvfs")
+    if base.exists():
+        return base
+    # older fallback used by some distros
+    fallback = Path.home() / ".gvfs"
+    return fallback if fallback.exists() else None
 
 
-def list_adb_devices() -> list:
-    """Returns [(serial, state), ...] e.g. [("R58N...", "device")]."""
-    adb = get_adb_path()
-    if not adb:
-        return []
-    try:
-        result = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=6)
-    except (subprocess.TimeoutExpired, OSError):
-        return []
-    lines = result.stdout.strip().splitlines()
-    devices = []
-    for line in lines[1:]:  # skip "List of devices attached"
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split()
-        if len(parts) >= 2:
-            devices.append((parts[0], parts[1]))
-    return devices
+def find_mtp_device(cfg: dict) -> Optional[Path]:
+    """Finds the mounted MTP device folder, e.g.
+    /run/user/1000/gvfs/mtp:host=SAMSUNG_SAMSUNG_Android_RFCY21WKX7X/Internal storage
+    Matches on a substring of the device name if configured (cfg['mtp_host_hint']),
+    otherwise just takes the first mtp: mount found."""
+    root = _gvfs_root()
+    if not root:
+        return None
+
+    hint = (cfg.get("mtp_host_hint") or "").strip()
+    candidates = sorted(root.glob("mtp:host=*"))
+    if not candidates:
+        return None
+
+    chosen = None
+    if hint:
+        for c in candidates:
+            if hint in c.name:
+                chosen = c
+                break
+        if chosen is None:
+            return None
+    else:
+        if len(candidates) > 1:
+            return None  # ambiguous, caller should ask user to set mtp_host_hint
+        chosen = candidates[0]
+
+    # descend into "Internal storage" (or whatever the single subfolder is)
+    subdirs = [d for d in chosen.iterdir() if d.is_dir()]
+    if len(subdirs) == 1:
+        return subdirs[0]
+    for d in subdirs:
+        if "internal" in d.name.lower():
+            return d
+    return chosen  # fall back to the host dir itself
 
 
 def device_status(cfg: dict) -> tuple:
-    """Returns (is_ready: bool, message: str) describing adb/device state."""
-    if not get_adb_path():
-        return False, "adb not found on PATH"
+    """Returns (is_ready: bool, message: str) describing the MTP mount state."""
+    root = _gvfs_root()
+    if not root:
+        return False, "No gvfs session found (is the file manager running?)"
 
-    devices = list_adb_devices()
-    if not devices:
-        return False, "No device connected"
+    candidates = sorted(root.glob("mtp:host=*"))
+    if not candidates:
+        return False, "No MTP device mounted. Open it once in your file manager first."
 
-    serial = (cfg.get("adb_serial") or "").strip()
-    if serial:
-        for s, state in devices:
-            if s == serial:
-                return state == "device", f"{s} ({state})"
-        return False, f"Configured device {serial} not found"
+    device = find_mtp_device(cfg)
+    if not device:
+        names = ", ".join(c.name for c in candidates)
+        return False, f"Multiple MTP devices mounted ({names}) - set mtp_host_hint in Settings"
 
-    if len(devices) == 1:
-        s, state = devices[0]
-        return state == "device", f"{s} ({state})"
+    if not device.exists():
+        return False, f"MTP mount vanished: {device}"
 
-    return False, f"{len(devices)} devices attached - set a serial in Settings"
-
-
-def _adb_prefix(cfg: dict) -> list:
-    cmd = [get_adb_path()]
-    serial = (cfg.get("adb_serial") or "").strip()
-    if serial:
-        cmd += ["-s", serial]
-    return cmd
+    return True, f"{device.name}"
 
 
 def pull_from_device(cfg: dict) -> tuple:
-    """Pulls the whole device waypoint tree and merges it into local_root.
-    Never deletes anything already in local_root (so sidecar notes and any
-    locally-only files survive). Returns (success, message)."""
-    adb = get_adb_path()
-    if not adb:
-        return False, "adb not found on PATH. Install android-tools/platform-tools."
+    """Copies the device waypoint tree (over MTP) into local_root.
+    Never deletes anything already local. Returns (success, message)."""
+    device_dir = find_mtp_device(cfg)
+    if not device_dir:
+        return False, "MTP device not found or ambiguous. Check Settings."
 
-    device_root = (cfg.get("device_root") or "").strip()
+    device_subpath = (cfg.get("device_root") or "").strip().lstrip("/")
     local_root_str = (cfg.get("local_root") or "").strip()
-    if not device_root:
-        return False, "Device waypoint path isn't set. Open Settings."
-    if not local_root_str:
-        return False, "Local folder isn't set. Open Settings."
+    if not device_subpath or not local_root_str:
+        return False, "Device path and local folder must both be set in Settings."
+
+    src_root = device_dir / device_subpath
+    if not src_root.exists():
+        return False, f"Path not found on device: {src_root}"
 
     local_root = Path(local_root_str).expanduser()
     local_root.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_target = Path(tmp) / "pulled"
-        cmd = _adb_prefix(cfg) + ["pull", device_root, str(tmp_target)]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        except subprocess.TimeoutExpired:
-            return False, "adb pull timed out (large folder or slow connection)."
-        except OSError as exc:
-            return False, f"Couldn't run adb: {exc}"
-
-        if result.returncode != 0 or not tmp_target.exists():
-            err = (result.stderr or result.stdout or "").strip()
-            return False, f"adb pull failed:\n{err or 'unknown error'}"
-
-        copied = 0
-        for src in tmp_target.rglob("*"):
-            if src.is_file():
-                rel = src.relative_to(tmp_target)
-                dest = local_root / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    errors = []
+    for src in src_root.rglob("*"):
+        if src.is_file():
+            rel = src.relative_to(src_root)
+            dest = local_root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
                 shutil.copy2(src, dest)
                 copied += 1
+            except OSError as exc:
+                # MTP occasionally hiccups on individual files - keep going
+                errors.append(f"{rel}: {exc}")
 
-    return True, f"Pulled {copied} file(s) from device into the local copy."
+    msg = f"Pulled {copied} file(s) from device into the local copy."
+    if errors:
+        msg += f" ({len(errors)} failed, see log)"
+    return True, msg
 
 
-def push_file_to_device(local_file: Path, cfg: dict) -> tuple:
-    """Pushes ONE local file back to its mirrored path on the device,
-    overwriting content there. Returns (success, message)."""
-    adb = get_adb_path()
-    if not adb:
-        return False, "adb not found on PATH."
+def push_file_to_device(cfg: dict, local_file: Path) -> tuple:
+    device_dir = find_mtp_device(cfg)
+    if not device_dir:
+        return False, "MTP device not found or ambiguous. Check Settings."
 
     local_root_str = (cfg.get("local_root") or "").strip()
-    device_root = (cfg.get("device_root") or "").strip().rstrip("/")
-    if not local_root_str or not device_root:
+    device_subpath = (cfg.get("device_root") or "").strip().lstrip("/")
+    if not local_root_str or not device_subpath:
         return False, "Local folder and device path must both be set in Settings."
 
     local_root = Path(local_root_str).expanduser()
@@ -259,20 +269,22 @@ def push_file_to_device(local_file: Path, cfg: dict) -> tuple:
     except ValueError:
         return False, "That file isn't inside the configured local folder."
 
-    device_target = device_root + "/" + str(rel).replace(os.sep, "/")
-    cmd = _adb_prefix(cfg) + ["push", str(local_file), device_target]
+    dest = device_dir / device_subpath / rel
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    except subprocess.TimeoutExpired:
-        return False, "adb push timed out."
-    except OSError as exc:
-        return False, f"Couldn't run adb: {exc}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            dest.unlink()
+        result = subprocess.run(
+            ["gio", "copy", "-p", str(local_file), str(dest)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip()
+            return False, f"gio copy failed: {err}"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"MTP push failed: {exc}"
 
-    if result.returncode != 0:
-        err = (result.stderr or result.stdout or "").strip()
-        return False, f"adb push failed:\n{err or 'unknown error'}"
     return True, f"Pushed {local_file.name} to device."
-
 
 # --------------------------------------------------------------------------
 # Data model
@@ -349,6 +361,10 @@ def scan_missions(local_root: Path, cfg: dict) -> list:
     missions = []
     for d in sorted(local_root.iterdir()):
         if not d.is_dir() or d.name == map_preview_name:
+            continue
+        if d.name in {"capability", "map_preview", ".gitignore", ""}:
+            continue
+        if d.name == None:
             continue
 
         mission_id = d.name  # the UUID
@@ -534,23 +550,25 @@ class App(tk.Tk):
         self.device_status_label.pack(side=tk.LEFT, padx=(4, 12))
         ttk.Button(row2, text="Pull from Phone", command=self.pull_from_phone).pack(side=tk.LEFT)
         ttk.Button(row2, text="Push All Changed to Phone", command=self.push_all_changed).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(row2, text="Settings...", command=self.open_settings).pack(side=tk.LEFT, padx=(6, 0))
+
+
 
         body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         # --- left: mission list ---
         left = ttk.Frame(body, padding=(8, 4))
-        columns = ("flight", "label", "mission_file", "thumb_file", "sync", "notes")
+        columns = ("flight", "label", "mission_file", "sync", "notes")
         self.tree = ttk.Treeview(left, columns=columns, show="headings", selectmode="browse")
         headings = {
             "flight": "Flight #",
             "label": "Label",
             "mission_file": "Mission file",
-            "thumb_file": "Thumbnail",
             "sync": "Sync",
             "notes": "Notes",
         }
-        widths = {"flight": 55, "label": 120, "mission_file": 150, "thumb_file": 130, "sync": 90, "notes": 140}
+        widths = {"flight": 55, "label": 120, "mission_file": 150, "sync": 90, "notes": 140}
         for col in columns:
             self.tree.heading(col, text=headings[col])
             self.tree.column(col, width=widths[col], anchor=tk.W)
@@ -564,12 +582,64 @@ class App(tk.Tk):
         body.add(left, weight=3)
 
         # --- right: details panel ---
+        
         right = ttk.Frame(body, padding=(8, 4))
 
-        self.thumb_label = ttk.Label(right, text="(no thumbnail)", anchor=tk.CENTER,
-                                      relief=tk.GROOVE, width=30)
-        self.thumb_label.pack(side=tk.TOP, pady=(0, 8), ipady=60)
+        image_frame = ttk.LabelFrame(
+            right,
+            text="Thumbnail and Preview"
+        )
+        image_frame.pack(
+            side=tk.TOP,
+            fill=tk.BOTH,
+            expand=True,
+            pady=(0, 8)
+        )
 
+        # Container for thumbnail + map
+        preview_frame = ttk.Frame(image_frame)
+        preview_frame.pack(
+            fill=tk.BOTH,
+            expand=True,
+            padx=8,
+            pady=8
+        )
+
+        # -------------------------
+        # Thumbnail - LEFT
+        # -------------------------
+
+        self.thumb_label = ttk.Label(
+            preview_frame,
+            text="(no thumbnail)",
+            anchor=tk.CENTER,
+            relief=tk.GROOVE,
+            width=30
+        )
+
+        self.thumb_label.pack(
+            side=tk.LEFT,
+            fill=tk.Y,
+            padx=(0, 8),
+            ipady=60
+        )
+
+        # -------------------------
+        # Map - RIGHT
+        # -------------------------
+
+        self.map_widget = TkinterMapView(
+            preview_frame,
+            corner_radius=0
+        )
+
+        self.map_widget.pack(
+            side=tk.LEFT,
+            fill=tk.BOTH,
+            expand=True
+        )
+        ### Files section (mission file and thumbnail file configuration)
+        
         files_frame = ttk.LabelFrame(right, text="Files (managed by DJI Fly - names locked)")
         files_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
 
@@ -592,11 +662,7 @@ class App(tk.Tk):
         #            command=lambda: self.replace_file("mission")).grid(row=0, column=3, padx=3)
         ttk.Button(files_frame, text="Reveal",
                    command=lambda: self.reveal_file("mission")).grid(row=0, column=5, padx=3)
-        
-        ### ----- Display Mission file Source
-        ttk.Label(files_frame, text="CSV Mission file:").grid(row=2, column=0, sticky=tk.W, padx=4, pady=2)
-        ttk.Label(files_frame, textvariable=self.source_file_var, foreground="#333").grid(
-            row=2, column=1, sticky=tk.W, padx=4, pady=2)
+
 
         ### Thumbnail row and actions
         ttk.Label(files_frame, text="Thumbnail:").grid(row=1, column=0, sticky=tk.W, padx=4, pady=2)
@@ -609,8 +675,57 @@ class App(tk.Tk):
         ttk.Button(files_frame, text="Reveal",
                    command=lambda: self.reveal_file("thumbnail")).grid(row=1, column=5, padx=3)
 
+        ### ----- Display Mission file Source
+        source_frame = ttk.LabelFrame(
+            files_frame,
+            text="Mission Source"
+        )
+        source_frame.grid(
+            row=2,
+            column=0,
+            columnspan=6,
+            sticky=tk.EW,
+            padx=4,
+            pady=(6, 2)
+        )
 
+        source_frame.columnconfigure(1, weight=1)
 
+        ttk.Label(
+            source_frame,
+            text="CSV Mission file:"
+        ).grid(
+            row=0,
+            column=0,
+            sticky=tk.W,
+            padx=4,
+            pady=4
+        )
+
+        ttk.Label(
+            source_frame,
+            textvariable=self.source_file_var,
+            foreground="#333"
+        ).grid(
+            row=0,
+            column=1,
+            sticky=tk.EW,
+            padx=4,
+            pady=4
+        )
+        # Push button underneath
+        ttk.Button(
+            source_frame,
+            text="Push",
+            command=lambda: self.push_file()
+        ).grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            pady=(4, 4)
+        )
+
+        ### Notes section (flight number, label, notes)
 
         meta_frame = ttk.LabelFrame(right, text="Your tracking info (local only - never pushed to phone)")
         meta_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -697,7 +812,6 @@ class App(tk.Tk):
                 m.meta.get("flight_number") or "",
                 m.meta.get("label") or "",
                 m.mission_file.name if m.mission_file else "(none)",
-                m.thumbnail_file.name if m.thumbnail_file else "(none)",
                 sync_text,
                 notes_preview,
             ))
@@ -732,6 +846,7 @@ class App(tk.Tk):
         self.notes_text.insert("1.0", m.meta.get("notes") or "")
 
         self._update_thumbnail(m)
+        self._update_map_preview(m)
 
     def _update_thumbnail(self, m: Mission):
         if not m.thumbnail_file or not m.thumbnail_file.exists():
@@ -752,6 +867,189 @@ class App(tk.Tk):
         except Exception as exc:  # noqa: BLE001 - surface any load failure, not just PIL's own errors
             self.thumb_label.configure(image="", text=f"(couldn't load image)\n{exc}")
             self._thumb_imgtk = None
+
+
+    def _update_map_preview(self, m: Mission):
+        """
+        Load a DJI Fly mission file (.kmz, .wpml or .kml) and display
+        the waypoint path on the tkinter map widget.
+        """
+
+        mission_file = Path(m.mission_file)
+
+        if not mission_file.exists() or not mission_file.is_file():
+            return
+
+        try:
+            # ---------------------------------------------------------
+            # 1. Load XML data
+            # ---------------------------------------------------------
+
+            suffix = mission_file.suffix.lower()
+
+            if suffix == ".kmz":
+                # KMZ is a ZIP archive
+                with zipfile.ZipFile(mission_file, "r") as kmz:
+
+                    # DJI KMZ files normally contain waylines.wpml
+                    wpml_files = [
+                        name for name in kmz.namelist()
+                        if name.lower().endswith((".wpml", ".kml"))
+                    ]
+
+                    if not wpml_files:
+                        raise ValueError(
+                            "No WPML or KML file found inside the KMZ"
+                        )
+
+                    # Prefer waylines.wpml if present
+                    mission_xml = next(
+                        (
+                            name for name in wpml_files
+                            if name.lower().endswith("waylines.wpml")
+                        ),
+                        wpml_files[0]
+                    )
+
+                    xml_data = kmz.read(mission_xml)
+
+            elif suffix in (".wpml", ".kml"):
+                # Already extracted XML
+                xml_data = mission_file.read_bytes()
+
+            else:
+                raise ValueError(
+                    f"Unsupported mission file type: {suffix}"
+                )
+
+            # ---------------------------------------------------------
+            # 2. Parse XML
+            # ---------------------------------------------------------
+
+            root = ET.fromstring(xml_data)
+
+            namespaces = {
+                "kml": "http://www.opengis.net/kml/2.2",
+                "wpml": "http://www.dji.com/wpmz/1.0.2",
+            }
+
+            # ---------------------------------------------------------
+            # 3. Extract DJI waypoint coordinates
+            # ---------------------------------------------------------
+
+            waypoints = []
+
+            placemarks = root.findall(
+                ".//kml:Placemark",
+                namespaces
+            )
+
+            for placemark in placemarks:
+
+                coordinates = placemark.find(
+                    ".//kml:Point/kml:coordinates",
+                    namespaces
+                )
+
+                if coordinates is None or not coordinates.text:
+                    continue
+
+                # KML format:
+                # longitude,latitude[,altitude]
+                parts = coordinates.text.strip().split(",")
+
+                if len(parts) < 2:
+                    continue
+
+                lon = float(parts[0])
+                lat = float(parts[1])
+
+                # Read DJI waypoint index if available
+                index_element = placemark.find(
+                    "wpml:index",
+                    namespaces
+                )
+
+                index = (
+                    int(index_element.text)
+                    if index_element is not None
+                    else len(waypoints)
+                )
+
+                waypoints.append({
+                    "index": index,
+                    "lat": lat,
+                    "lon": lon,
+                })
+
+            # Make sure waypoints are in mission order
+            waypoints.sort(key=lambda wp: wp["index"])
+
+            points = [
+                (wp["lat"], wp["lon"])
+                for wp in waypoints
+            ]
+
+            if not points:
+                raise ValueError("No waypoint coordinates found")
+
+            # ---------------------------------------------------------
+            # 4. Clear existing map objects if desired
+            # ---------------------------------------------------------
+
+            # Uncomment if your map widget supports it
+            self.map_widget.delete_all_marker()
+            self.map_widget.delete_all_path()
+
+            # ---------------------------------------------------------
+            # 5. Display the mission
+            # ---------------------------------------------------------
+
+            # Center on first waypoint
+            self.map_widget.set_position(
+                points[0][0],
+                points[0][1]
+            )
+
+            # Draw the flight path
+            if len(points) > 1:
+                self.map_widget.set_path(points)
+
+            # Add numbered waypoint markers
+            # for i, (lat, lon) in enumerate(points):
+            #     self.map_widget.set_marker(
+            #         lat,
+            #         lon,
+            #         text=str(i)
+            #     )
+
+            # Optional: fit map to the complete mission
+            # if your tkintermapview version supports it:
+            #
+            # map_widget.fit_bounding_box(
+            #     (min(lat for lat, lon in points),
+            #      min(lon for lat, lon in points)),
+            #     (max(lat for lat, lon in points),
+            #      max(lon for lat, lon in points))
+            # )
+
+        except zipfile.BadZipFile:
+            messagebox.showerror(
+                "Error",
+                "The mission file is not a valid KMZ archive."
+            )
+
+        except ET.ParseError as e:
+            messagebox.showerror(
+                "Error",
+                f"Could not parse mission XML:\n{e}"
+            )
+
+        except Exception as e:
+            messagebox.showerror(
+                "Error",
+                str(e)
+            )
 
     # ---- notes -------------------------------------------------
 
@@ -899,23 +1197,23 @@ class App(tk.Tk):
             self.status_var.set("Pull failed")
             messagebox.showerror("Pull from phone failed", message)
 
-    def push_one(self, kind: str):
+    def push_file(self):
         if not self.selected:
             return
         m = self.selected
-        target = m.mission_file if kind == "mission" else m.thumbnail_file
-        if target is None:
-            messagebox.showinfo("Nothing to push", f"This mission has no {kind} file.")
-            return
-
+        
         ready, message = device_status(self.cfg)
         if not ready:
             messagebox.showwarning("Device not ready", f"Can't reach the phone: {message}")
             return
 
+        # if m.meta["mission_file_dirty"] == True:
+        target = m.mission_file
+        kind = "mission"
+
         self.status_var.set(f"Pushing {target.name}...")
         self.update_idletasks()
-        success, message = push_file_to_device(target, self.cfg)
+        success, message = push_file_to_device(self.cfg, target)
         if success:
             if kind == "mission":
                 m.meta["mission_file_dirty"] = False
@@ -929,6 +1227,29 @@ class App(tk.Tk):
         else:
             self.status_var.set("Push failed")
             messagebox.showerror("Push to phone failed", message)
+        
+        if m.meta["thumbnail_dirty"] == True:
+            target = m.thumbnail_file
+            kind = "thumbnail"
+
+            self.status_var.set(f"Pushing {target.name}...")
+            self.update_idletasks()
+            success, message = push_file_to_device(self.cfg, target)
+            if success:
+                if kind == "mission":
+                    m.meta["mission_file_dirty"] = False
+                else:
+                    m.meta["thumbnail_dirty"] = False
+                m.save_meta()
+                self._refresh_tree()
+                self.tree.selection_set(m.mission_id)
+                self.on_select()
+                self.status_var.set(message)
+            else:
+                self.status_var.set("Push failed")
+                messagebox.showerror("Push to phone failed", message)
+
+
 
     def push_all_changed(self):
         ready, message = device_status(self.cfg)
@@ -951,14 +1272,14 @@ class App(tk.Tk):
         pushed, failed = 0, []
         for m in to_push:
             if m.meta.get("mission_file_dirty") and m.mission_file:
-                ok, msg = push_file_to_device(m.mission_file, self.cfg)
+                ok, msg = push_file_to_device(self.cfg, m.mission_file)
                 if ok:
                     m.meta["mission_file_dirty"] = False
                     pushed += 1
                 else:
                     failed.append(f"{m.mission_id} (mission file): {msg}")
             if m.meta.get("thumbnail_dirty") and m.thumbnail_file:
-                ok, msg = push_file_to_device(m.thumbnail_file, self.cfg)
+                ok, msg = push_file_to_device(self.cfg, m.thumbnail_file)
                 if ok:
                     m.meta["thumbnail_dirty"] = False
                     pushed += 1

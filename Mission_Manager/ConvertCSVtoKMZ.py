@@ -70,13 +70,12 @@ MAVIC3_PAYLOAD_POSITION = 0    # main gimbal
 
 MAX_SPEED_MS = 15.0    
 
-WPML_NS = "http://www.dji.com/wpmz/1.0.2"
+WPML_NS = "http://www.uav.com/wpmz/1.0.2"
 KML_NS  = "http://www.opengis.net/kml/2.2"
 
 
 FINISH_ACTION = "noAction"  # goHome | hover | autoLand | noAction
-EXECUTE_LOST_ACTION = "goHome"  # goContinue | executeLostAction | goHome | hover
-ACTION_COUNT = 1
+EXECUTE_LOST_ACTION = "goBack"  # goContinue | executeLostAction | goHome | hover
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -191,7 +190,7 @@ def build_template_kml(mission_name: str, args) -> str:
     _sub(mc, "finishAction", FINISH_ACTION, ns=WPML_NS)
     _sub(mc, "exitOnRCLost", "executeLostAction", ns=WPML_NS)
     _sub(mc, "executeRCLostAction", EXECUTE_LOST_ACTION, ns=WPML_NS)
-    _sub(mc, "globalTransitionalSpeed", "2.5", ns=WPML_NS)
+    _sub(mc, "globalTransitionalSpeed", str(args.speed), ns=WPML_NS)
 
     di = _sub(mc, "droneInfo", ns=WPML_NS)
     _sub(di, "droneEnumValue", "68", ns=WPML_NS)
@@ -203,24 +202,23 @@ def build_template_kml(mission_name: str, args) -> str:
 
     # ── WMPL Creation ──────────────────────────────────────────────────────
 
-def add_placemark(folder, row, index):
+def add_placemark(folder, row, index, action_id, args) -> int:
     pm = _sub(folder, "Placemark")
 
+    indent_level = 4  # depth of <coordinates> in your tree, in spaces-per-level units
+    inner_indent = "  " * (indent_level + 1)
+    outer_indent = "  " * indent_level
+
     point = _sub(pm, "Point")
-    _sub(
-        point,
-        "coordinates",
-        f"{row['longitude']},{row['latitude']}"
-    )
+    coords = _sub(point, "coordinates")
+    coords.text = f"\n{inner_indent}{row['longitude']},{row['latitude']}\n{outer_indent}"
+    
 
     _sub(pm, "index", str(index), ns=WPML_NS)
     _sub(pm, "executeHeight", row["altitude(m)"], ns=WPML_NS)
-    _sub(pm, "waypointSpeed", row["speed(m/s)"] or "2.5", ns=WPML_NS)
+    _sub(pm, "waypointSpeed", row["speed(m/s)"] or str(args.speed), ns=WPML_NS)
 
-    
-    global ACTION_COUNT
-    
-    
+
     heading_angle = -90 if ((index - 1) // 2) % 2 == 0 else 90    
     if str(index) == "0":
         heading_angle = -90
@@ -255,9 +253,9 @@ def add_placemark(folder, row, index):
         _sub(trigger, "actionTriggerType", "reachPoint", ns=WPML_NS)
 
         action = _sub(ag0, "action", ns=WPML_NS)
-        _sub(action, "actionId", str(ACTION_COUNT), ns=WPML_NS)
+        _sub(action, "actionId", str(action_id), ns=WPML_NS)
         _sub(action, "actionActuatorFunc", "gimbalRotate", ns=WPML_NS)
-        ACTION_COUNT += 1
+        action_id += 1
 
         params = _sub(action, "actionActuatorFuncParam", ns=WPML_NS)
         _sub(params, "gimbalHeadingYawBase", "aircraft", ns=WPML_NS)
@@ -283,7 +281,7 @@ def add_placemark(folder, row, index):
     _sub(trigger, "actionTriggerType", "reachPoint", ns=WPML_NS)
 
     action = _sub(ag1, "action", ns=WPML_NS)
-    _sub(action, "actionId", str(ACTION_COUNT), ns=WPML_NS)
+    _sub(action, "actionId", str(action_id), ns=WPML_NS)
     _sub(action, "actionActuatorFunc", "gimbalEvenlyRotate", ns=WPML_NS)
 
     params = _sub(action, "actionActuatorFuncParam", ns=WPML_NS)
@@ -291,11 +289,12 @@ def add_placemark(folder, row, index):
     _sub(params, "gimbalRollRotateAngle", "0", ns=WPML_NS)
     _sub(params, "payloadPositionIndex", "0", ns=WPML_NS)
     
-    gimbalHeading = _sub(ag1, "waypointGimbalHeadingParam", ns=WPML_NS)
+    gimbalHeading = _sub(pm, "waypointGimbalHeadingParam", ns=WPML_NS)
     _sub(gimbalHeading, "waypointGimbalPitchAngle", "0", ns=WPML_NS)
     _sub(gimbalHeading, "waypointGimbalYawAngle", "0", ns=WPML_NS)
     
-    ACTION_COUNT += 1
+    action_id += 1
+    return action_id
 
 
 
@@ -319,7 +318,7 @@ def build_waylines_wpml(rows: list[dict], args) -> str:
     _sub(mc, "finishAction", FINISH_ACTION, ns=WPML_NS)
     _sub(mc, "exitOnRCLost", "executeLostAction", ns=WPML_NS)
     _sub(mc, "executeRCLostAction", EXECUTE_LOST_ACTION, ns=WPML_NS)
-    _sub(mc, "globalTransitionalSpeed", "2.5", ns=WPML_NS)
+    _sub(mc, "globalTransitionalSpeed", str(args.speed), ns=WPML_NS)
 
     di = _sub(mc, "droneInfo", ns=WPML_NS)
     _sub(di, "droneEnumValue", "68", ns=WPML_NS)
@@ -334,10 +333,11 @@ def build_waylines_wpml(rows: list[dict], args) -> str:
     _sub(fd, "waylineId", "0", ns=WPML_NS)
     _sub(fd, "distance", "0", ns=WPML_NS)
     _sub(fd, "duration", "0", ns=WPML_NS)
-    _sub(fd, "autoFlightSpeed", "2.5", ns=WPML_NS)
+    _sub(fd, "autoFlightSpeed", str(args.speed), ns=WPML_NS)
 
+    action_id = 1
     for index, row in enumerate(rows):
-        add_placemark(fd, row, index)
+        action_id = add_placemark(fd, row, index, action_id, args)
 
 
     return _xml_declaration() + _pretty(kml)
@@ -358,9 +358,9 @@ def parse_args(argv=None):
                    help="Global flight speed m/s (default 5.0, max 15)")
     p.add_argument("--altitude", type=float, default=None,
                    help="Override altitude AGL in metres (uses CSV values if omitted)")
-    p.add_argument("--finish",   default="goHome",
-                   choices=["goHome", "hover", "autoLand"],
-                   help="Mission finish action (default: goHome)")
+    p.add_argument("--finish",   default="goBack",
+                   choices=["goBack", "hover", "autoLand"],
+                   help="Mission finish action (default: goBack)")
     p.add_argument("--lost",     default="goContinue",
                    choices=["goContinue", "executeLostAction"],
                    help="RC lost action (default: goContinue)")
@@ -400,8 +400,8 @@ def build_kmz_from_csv(input_path: str, output_path: str) -> None:
         output=output_path,
         speed=5.0,
         altitude=None,
-        finish="goHome",
-        lost="goContinue",
+        finish="goBack",
+        lost="goBack",
         takeoff_h=30.0,
         no_photo=False,
     )
