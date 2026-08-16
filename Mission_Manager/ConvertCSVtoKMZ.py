@@ -62,6 +62,8 @@ from datetime import datetime, timezone
 
 from zipfile import ZipFile, ZIP_DEFLATED
 
+import re
+
 
 MAVIC3_DRONE_ENUM       = 68   # Mavic 3 series
 MAVIC3_DRONE_SUB_ENUM   = 0
@@ -85,10 +87,31 @@ def _pretty(element: ET.Element) -> str:
     raw = ET.tostring(element, encoding="unicode")
     reparsed = minidom.parseString(raw)
     pretty = reparsed.toprettyxml(indent="  ")
+
     # Remove the XML declaration line that minidom prepends (we add our own)
     lines = pretty.splitlines()
-    return "\n".join(lines[1:])   # drop <?xml …?> line
+    lines = lines[1:]  # drop <?xml …?> line
 
+    # Remove blank lines minidom sometimes adds between elements
+    lines = [line for line in lines if line.strip()]
+
+    pretty = "\n".join(lines)
+
+    # Reformat <coordinates>...</coordinates> onto its own indented line
+    def _split_coords(match: re.Match) -> str:
+        indent = match.group(1)
+        coords = match.group(2)
+        inner_indent = indent + "  "
+        return f"{indent}<coordinates>\n{inner_indent}{coords}\n{indent}</coordinates>"
+
+    pretty = re.sub(
+        r"^([ \t]*)<coordinates>(.*?)</coordinates>$",
+        _split_coords,
+        pretty,
+        flags=re.MULTILINE,
+    )
+
+    return pretty
 
 def _xml_declaration() -> str:
     return '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -205,17 +228,14 @@ def build_template_kml(mission_name: str, args) -> str:
 def add_placemark(folder, row, index, action_id, args) -> int:
     pm = _sub(folder, "Placemark")
 
-    indent_level = 4  # depth of <coordinates> in your tree, in spaces-per-level units
-    inner_indent = "  " * (indent_level + 1)
-    outer_indent = "  " * indent_level
 
     point = _sub(pm, "Point")
     coords = _sub(point, "coordinates")
-    coords.text = f"\n{inner_indent}{row['longitude']},{row['latitude']}\n{outer_indent}"
+    coords.text = f"{row['longitude']},{row['latitude']}"
     
 
     _sub(pm, "index", str(index), ns=WPML_NS)
-    _sub(pm, "executeHeight", row["altitude(m)"], ns=WPML_NS)
+    _sub(pm, "executeHeight", int(float(row["altitude(m)"])), ns=WPML_NS)
     _sub(pm, "waypointSpeed", row["speed(m/s)"] or str(args.speed), ns=WPML_NS)
 
 
@@ -339,11 +359,59 @@ def build_waylines_wpml(rows: list[dict], args) -> str:
     for index, row in enumerate(rows):
         action_id = add_placemark(fd, row, index, action_id, args)
 
+    ## Add in the final waypoint to ensure the drone completes the last action group
+    pm = _sub(fd, "Placemark")
+    point = _sub(pm, "Point")
+    coords = _sub(point, "coordinates")
+    min_lon = float("inf")
+    max_lon = float("-inf")
+    min_lat = float("inf")
+    max_lat = float("-inf")
+
+    for row in rows:
+        lon = float(row["longitude"])
+        lat = float(row["latitude"])
+        min_lon = min(min_lon, lon)
+        max_lon = max(max_lon, lon)
+        min_lat = min(min_lat, lat)
+        max_lat = max(max_lat, lat)
+
+    center_lon = (min_lon + max_lon) / 2
+    center_lat = (min_lat + max_lat) / 2
+    coords.text = f"{center_lon},{center_lat}"    
+
+    _sub(pm, "index", str(index), ns=WPML_NS)
+    _sub(pm, "executeHeight", int(float(rows[-1]["altitude(m)"])), ns=WPML_NS)
+    _sub(pm, "waypointSpeed", rows[-1]["speed(m/s)"] or str(args.speed), ns=WPML_NS)
+
+
+    heading_angle = -90 if ((index - 1) // 2) % 2 == 0 else 90    
+    if str(index) == "0":
+        heading_angle = -90
+
+    ##### ------ Heading
+    heading = _sub(pm, "waypointHeadingParam", ns=WPML_NS)
+    _sub(heading, "waypointHeadingMode", "followWayline", ns=WPML_NS)           ## This means the specific heading isn't needed and the drone won't do sick 360's in the main lengths
+    _sub(heading, "waypointHeadingAngle", str(heading_angle), ns=WPML_NS)
+    _sub(heading, "waypointPoiPoint", "0.000000,0.000000,0.000000", ns=WPML_NS)
+    _sub(heading, "waypointHeadingAngleEnable", "1" if str(index) == "0" else "0", ns=WPML_NS)
+    _sub(heading, "waypointHeadingPathMode", "followBadArc", ns=WPML_NS)
+    _sub(heading, "waypointHeadingPoiIndex", "0", ns=WPML_NS)
+    
+    ##### ------ Turn
+    turn = _sub(pm, "waypointTurnParam", ns=WPML_NS)
+    _sub(turn, "waypointTurnMode", "toPointAndStopWithContinuityCurvature")
+    _sub(turn, "waypointTurnDampingDist", "0", ns=WPML_NS)
+    _sub(pm, "useStraightLine", "0", ns=WPML_NS)
+
+    ###### ------ Gimbal    
+    gimbalHeading = _sub(pm, "waypointGimbalHeadingParam", ns=WPML_NS)
+    _sub(gimbalHeading, "waypointGimbalPitchAngle", "0", ns=WPML_NS)
+    _sub(gimbalHeading, "waypointGimbalYawAngle", "0", ns=WPML_NS)
+    
+    action_id += 1
 
     return _xml_declaration() + _pretty(kml)
-
-
-
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
