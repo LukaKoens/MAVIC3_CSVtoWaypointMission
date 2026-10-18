@@ -10,26 +10,16 @@ that DJI Fly itself must own.
 WORKFLOW: LOCAL COPY FIRST, SYNC TO PHONE WHEN CONNECTED
 -----------------------------------------------------------
 All browsing and editing in this app happens against a **local folder** on
-your computer, not directly on the phone. That's deliberate: the phone's
-`Android/data/...` folder is normally only reachable over MTP, and MTP is
-not a real filesystem - writes to it are unreliable and can quietly fail or
-corrupt data. So the flow is:
+your computer, not directly on the phone/controller. The flow is:
 
-    1. Connect the phone with USB debugging enabled (adb).
-    2. "Pull from Phone" - copies the waypoint folder from the phone down
-       into your local working copy (merges in; never deletes local-only
-       files, e.g. your notes).
-    3. Browse/tag/edit entirely against the local copy - fast, reliable,
-       works offline.
-    4. When you actually want to swap a mission's or thumbnail's content,
-       that edit is applied locally and flagged as "needs push".
-    5. "Push to Phone" (per-file or "push all changed") sends just the
-       flagged files back to the phone via adb, overwriting their content
-       in place. Filenames on the phone are never changed.
-
-adb is used instead of MTP/gvfs for the actual transfer because it's a
-proper file-transfer protocol (not an emulated one) and is far more
-reliable for writing files back.
+    1. Connect the phone/RC and open it once in your file manager (MTP).
+    2. "Pull from Phone" - copies the waypoint folder down into your local
+       working copy (merges in; never deletes local-only files).
+    3. Browse/tag/edit entirely against the local copy.
+    4. Edits are applied locally and flagged as "needs push".
+    5. "Push" (per mission, or "push all changed") sends the flagged files
+       back, overwriting their content in place. Filenames on the device are
+       never changed.
 
 CONFIRMED ON-DISK LAYOUT (DJI Fly / Android, files/waypoint/)
 -----------------------------------------------------------------
@@ -37,33 +27,19 @@ CONFIRMED ON-DISK LAYOUT (DJI Fly / Android, files/waypoint/)
         <UUID>/<UUID>.kmz                       <- the mission itself
         map_preview/<UUID>/<UUID>.jpg           <- that mission's thumbnail
 
-Mission files and their thumbnails live in two separate, mirrored trees
-under the same waypoint root, joined by the shared UUID folder name. Your
-local working copy should mirror this same structure (that's exactly what
-"Pull from Phone" produces).
-
-The scanner:
-  * Lists every subfolder of the local waypoint root except `map_preview` -
-    each one is a mission, named by its UUID.
-  * Looks inside that UUID folder for a file whose name matches the UUID
-    (any extension - `.kmz` is what's been seen, but this isn't hardcoded
-    in case DJI Fly uses something else for a mission, e.g. `.wpml`).
-  * Looks for the thumbnail at `map_preview/<UUID>/<UUID>.<image-ext>`.
-
-No files DJI Fly owns are ever renamed or deleted by this app, locally or
-on the phone. The only file this app creates is a small JSON sidecar
-(`mission_notes.json`) placed inside each mission's own local UUID folder -
-that sidecar is never pushed to the phone, it's purely local tracking.
+No files DJI Fly owns are ever renamed or deleted by this app. The only file
+this app creates is a small JSON sidecar (`mission_notes.json`) inside each
+mission's own LOCAL UUID folder - never pushed to the device.
 """
 
 import json
 import os
 import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -72,7 +48,6 @@ import zipfile
 import xml.etree.ElementTree as ET
 from tkintermapview import TkinterMapView
 
-import glob
 from ConvertCSVtoKMZ import build_kmz_from_csv
 
 try:
@@ -89,25 +64,16 @@ except ImportError:
 APP_NAME = "dji_waypoint_manager"
 CONFIG_DIR = Path.home() / ".config" / APP_NAME
 CONFIG_PATH = CONFIG_DIR / "config.json"
-IGNORE_PATH = CONFIG_DIR / "ignore.json"
 
 DEFAULT_CONFIG = {
-    # Local folder that mirrors the phone's waypoint/ folder. This is what
-    # the app actually browses and edits.
+    # Local folder that mirrors the device's waypoint/ folder.
     "local_root": "",
-    # Path to the waypoint folder ON THE PHONE, as adb sees it, e.g.
-    # "/storage/emulated/0/Android/data/dji.go.v5/files/waypoint"
+    # Path to the waypoint folder INSIDE the device's storage, e.g.
+    # "Android/data/dji.go.v5/files/waypoint"
     "device_root": "",
-    # Optional - only needed if more than one device/emulator is attached.
     "adb_serial": "",
-    # Name of the sibling folder that mirrors the mission UUID folders but
-    # holds thumbnails instead of mission files.
     "map_preview_dirname": "map_preview",
-    # Extensions treated as thumbnail images (case-insensitive, with dot)
     "image_extensions": [".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic"],
-    # Filename this app creates inside each mission's own LOCAL UUID folder
-    # to store flight number / label / notes / push-state. Never sent to
-    # the phone, never touched by DJI Fly.
     "sidecar_name": "mission_notes.json",
 }
 
@@ -115,8 +81,8 @@ MISSION_META_DEFAULTS = {
     "flight_number": "",
     "label": "",
     "notes": "",
-    "source_csv": "",  # path to the CSV that generated this mission (local only)
-    "mission_file_dirty": False,   # True = local edit not yet pushed to phone
+    "source_csv": "",              # CSV that generated this mission (local only)
+    "mission_file_dirty": False,   # True = local edit not yet pushed
     "thumbnail_dirty": False,
 }
 
@@ -128,7 +94,6 @@ def load_config() -> dict:
             cfg = json.loads(CONFIG_PATH.read_text())
             merged = dict(DEFAULT_CONFIG)
             merged.update(cfg)
-            # Migrate from the older single "base_path" key, if present.
             if not merged.get("local_root") and cfg.get("base_path"):
                 merged["local_root"] = cfg["base_path"]
             return merged
@@ -141,26 +106,30 @@ def save_config(cfg: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
 
+
+def shorten(text: str, limit: int = 60) -> str:
+    """Shorten long paths from the left: '…/Mission_Manager/waypoint'."""
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return "…" + text[-(limit - 1):]
+
+
 # --------------------------------------------------------------------------
-# MTP (gvfs) helpers — alternative to adb, no USB debugging required
+# MTP (gvfs) helpers
 # --------------------------------------------------------------------------
 
 def _gvfs_root() -> Optional[Path]:
-    """Finds the gvfs mount directory for the current user session."""
     uid = os.getuid()
     base = Path(f"/run/user/{uid}/gvfs")
     if base.exists():
         return base
-    # older fallback used by some distros
     fallback = Path.home() / ".gvfs"
     return fallback if fallback.exists() else None
 
 
 def find_mtp_device(cfg: dict) -> Optional[Path]:
-    """Finds the mounted MTP device folder, e.g.
-    /run/user/1000/gvfs/mtp:host=SAMSUNG_SAMSUNG_Android_RFCY21WKX7X/Internal storage
-    Matches on a substring of the device name if configured (cfg['mtp_host_hint']),
-    otherwise just takes the first mtp: mount found."""
+    """Finds the mounted MTP device storage folder."""
     root = _gvfs_root()
     if not root:
         return None
@@ -180,21 +149,30 @@ def find_mtp_device(cfg: dict) -> Optional[Path]:
             return None
     else:
         if len(candidates) > 1:
-            return None  # ambiguous, caller should ask user to set mtp_host_hint
+            return None
         chosen = candidates[0]
 
-    # descend into "Internal storage" (or whatever the single subfolder is)
     subdirs = [d for d in chosen.iterdir() if d.is_dir()]
     if len(subdirs) == 1:
         return subdirs[0]
     for d in subdirs:
         if "internal" in d.name.lower():
             return d
-    return chosen  # fall back to the host dir itself
+    return chosen
+
+
+def clean_device_subpath(raw: str) -> str:
+    """Tolerate a pasted gvfs path / mtp:// URI; keep only the part inside
+    the storage root (e.g. 'Android/data/dji.go.v5/files/waypoint')."""
+    raw = unquote((raw or "").strip())
+    for marker in ("Internal shared storage/", "Internal storage/"):
+        if marker in raw:
+            raw = raw.split(marker)[-1]
+            break
+    return raw.lstrip("/")
 
 
 def device_status(cfg: dict) -> tuple:
-    """Returns (is_ready: bool, message: str) describing the MTP mount state."""
     root = _gvfs_root()
     if not root:
         return False, "No gvfs session found (is the file manager running?)"
@@ -211,17 +189,15 @@ def device_status(cfg: dict) -> tuple:
     if not device.exists():
         return False, f"MTP mount vanished: {device}"
 
-    return True, f"{device.name}"
+    return True, f"{device.parent.name}"
 
 
 def pull_from_device(cfg: dict) -> tuple:
-    """Copies the device waypoint tree (over MTP) into local_root.
-    Never deletes anything already local. Returns (success, message)."""
     device_dir = find_mtp_device(cfg)
     if not device_dir:
         return False, "MTP device not found or ambiguous. Check Settings."
 
-    device_subpath = (cfg.get("device_root") or "").strip().lstrip("/")
+    device_subpath = clean_device_subpath(cfg.get("device_root"))
     local_root_str = (cfg.get("local_root") or "").strip()
     if not device_subpath or not local_root_str:
         return False, "Device path and local folder must both be set in Settings."
@@ -244,12 +220,11 @@ def pull_from_device(cfg: dict) -> tuple:
                 shutil.copy2(src, dest)
                 copied += 1
             except OSError as exc:
-                # MTP occasionally hiccups on individual files - keep going
                 errors.append(f"{rel}: {exc}")
 
     msg = f"Pulled {copied} file(s) from device into the local copy."
     if errors:
-        msg += f" ({len(errors)} failed, see log)"
+        msg += f" ({len(errors)} failed)"
     return True, msg
 
 
@@ -259,7 +234,7 @@ def push_file_to_device(cfg: dict, local_file: Path) -> tuple:
         return False, "MTP device not found or ambiguous. Check Settings."
 
     local_root_str = (cfg.get("local_root") or "").strip()
-    device_subpath = (cfg.get("device_root") or "").strip().lstrip("/")
+    device_subpath = clean_device_subpath(cfg.get("device_root"))
     if not local_root_str or not device_subpath:
         return False, "Local folder and device path must both be set in Settings."
 
@@ -286,14 +261,15 @@ def push_file_to_device(cfg: dict, local_file: Path) -> tuple:
 
     return True, f"Pushed {local_file.name} to device."
 
+
 # --------------------------------------------------------------------------
 # Data model
 # --------------------------------------------------------------------------
 
 @dataclass
 class Mission:
-    mission_id: str                 # the UUID / folder name
-    container: Path                 # local mission folder
+    mission_id: str
+    container: Path
     mission_file: Optional[Path]
     thumbnail_file: Optional[Path]
     other_files: list = field(default_factory=list)
@@ -334,7 +310,6 @@ def is_image(path: Path, cfg: dict) -> bool:
 
 
 def _pick_matching_stem(files: list, stem: str) -> Optional[Path]:
-    """Prefer a file literally named `<stem>.<anything>`; else first file."""
     for f in files:
         if f.stem == stem:
             return f
@@ -342,15 +317,6 @@ def _pick_matching_stem(files: list, stem: str) -> Optional[Path]:
 
 
 def scan_missions(local_root: Path, cfg: dict) -> list:
-    """
-    Scan a local mirror of DJI Fly's `waypoint/` folder, laid out as:
-
-        waypoint/<UUID>/<UUID>.kmz
-        waypoint/map_preview/<UUID>/<UUID>.jpg
-
-    Each UUID subfolder (other than `map_preview` itself) is one mission.
-    """
-    
     if not local_root.exists() or not local_root.is_dir():
         return []
 
@@ -364,10 +330,8 @@ def scan_missions(local_root: Path, cfg: dict) -> list:
             continue
         if d.name in {"capability", "map_preview", ".gitignore", ""}:
             continue
-        if d.name == None:
-            continue
 
-        mission_id = d.name  # the UUID
+        mission_id = d.name
 
         mission_files = [
             f for f in sorted(d.iterdir())
@@ -399,12 +363,50 @@ def scan_missions(local_root: Path, cfg: dict) -> list:
     return missions
 
 
+def read_waypoints(mission_file: Path) -> list:
+    """Return [(lat, lon), ...] in mission order from a .kmz/.wpml/.kml file."""
+    suffix = mission_file.suffix.lower()
+
+    if suffix == ".kmz":
+        with zipfile.ZipFile(mission_file, "r") as kmz:
+            names = [n for n in kmz.namelist() if n.lower().endswith((".wpml", ".kml"))]
+            if not names:
+                raise ValueError("No WPML or KML file found inside the KMZ")
+            chosen = next((n for n in names if n.lower().endswith("waylines.wpml")), names[0])
+            xml_data = kmz.read(chosen)
+    elif suffix in (".wpml", ".kml"):
+        xml_data = mission_file.read_bytes()
+    else:
+        raise ValueError(f"Unsupported mission file type: {suffix}")
+
+    root = ET.fromstring(xml_data)
+    ns = {
+        "kml": "http://www.opengis.net/kml/2.2",
+        "wpml": "http://www.dji.com/wpmz/1.0.2",
+    }
+
+    waypoints = []
+    for pm in root.findall(".//kml:Placemark", ns):
+        coords = pm.find(".//kml:Point/kml:coordinates", ns)
+        if coords is None or not coords.text:
+            continue
+        parts = coords.text.strip().split(",")
+        if len(parts) < 2:
+            continue
+        idx_el = pm.find("wpml:index", ns)
+        index = int(idx_el.text) if idx_el is not None else len(waypoints)
+        waypoints.append((index, float(parts[1]), float(parts[0])))
+
+    waypoints.sort(key=lambda w: w[0])
+    return [(lat, lon) for _, lat, lon in waypoints]
+
+
 # --------------------------------------------------------------------------
 # GUI
 # --------------------------------------------------------------------------
 
-THUMB_SIZE = (220, 220)
-DEVICE_PATH_HINT = "/storage/emulated/0/Android/data/dji.go.v5/files/waypoint"
+THUMB_BOX = 170   # square box (px) the thumbnail is fitted into
+DEVICE_PATH_HINT = "Android/data/dji.go.v5/files/waypoint"
 
 
 class SettingsDialog(tk.Toplevel):
@@ -434,14 +436,14 @@ class SettingsDialog(tk.Toplevel):
 
         ttk.Separator(frm).grid(row=3, column=0, columnspan=3, sticky=tk.EW, pady=10)
 
-        ttk.Label(frm, text="Device waypoint path (as adb sees it):").grid(row=4, column=0, sticky=tk.W, **pad)
+        ttk.Label(frm, text="Device waypoint path (inside the storage root):").grid(row=4, column=0, sticky=tk.W, **pad)
         self.device_var = tk.StringVar(value=cfg.get("device_root", ""))
         ttk.Entry(frm, textvariable=self.device_var, width=52).grid(row=5, column=0, columnspan=2, sticky=tk.EW, padx=8)
         ttk.Button(frm, text="Use example", command=self._fill_example).grid(row=5, column=2, padx=8)
         ttk.Label(
             frm, foreground="#666", wraplength=460, justify=tk.LEFT,
             text=f"Typically:\n{DEVICE_PATH_HINT}\n"
-                 "Confirm with: adb shell ls \"<path>\""
+                 "Do not include the device name or 'Internal shared storage'."
         ).grid(row=6, column=0, columnspan=3, sticky=tk.W, padx=8)
 
         ttk.Separator(frm).grid(row=7, column=0, columnspan=3, sticky=tk.EW, pady=10)
@@ -482,7 +484,7 @@ class SettingsDialog(tk.Toplevel):
             return
 
         self.cfg["local_root"] = local_val
-        self.cfg["device_root"] = self.device_var.get().strip()
+        self.cfg["device_root"] = clean_device_subpath(self.device_var.get())
         self.cfg["adb_serial"] = self.serial_var.get().strip()
         save_config(self.cfg)
         self.destroy()
@@ -493,13 +495,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("DJI Waypoint Mission Manager")
-        self.geometry("1040x620")
-        self.minsize(820, 480)
+        self.geometry("1100x700")
+        self.minsize(900, 620)
 
         self.cfg = load_config()
         self.missions: list = []
         self.selected: Optional[Mission] = None
-        self._thumb_imgtk = None  # keep reference alive
+        self._thumb_imgtk = None
 
         self._build_menu()
         self._build_layout()
@@ -531,117 +533,92 @@ class App(tk.Tk):
         self.bind("<F5>", lambda e: self.rescan())
 
     def _build_layout(self):
+        # Status bar goes in FIRST so it is never pushed off the bottom
+        # when the window is short.
+        self.status_var = tk.StringVar(value="Ready")
+        ttk.Label(
+            self, textvariable=self.status_var, relief=tk.SUNKEN,
+            anchor=tk.W, padding=(6, 2),
+        ).pack(side=tk.BOTTOM, fill=tk.X)
+
+        # ---- top bar: info on the left, actions on the right ----
         top = ttk.Frame(self, padding=(8, 6))
         top.pack(side=tk.TOP, fill=tk.X)
+        top.columnconfigure(1, weight=1)
 
-        row1 = ttk.Frame(top)
-        row1.pack(side=tk.TOP, fill=tk.X)
-        self.path_var = tk.StringVar(value=self.cfg.get("local_root") or "(not set)")
-        ttk.Label(row1, text="Local copy:").pack(side=tk.LEFT)
-        ttk.Label(row1, textvariable=self.path_var, foreground="#555").pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Button(row1, text="Settings...", command=self.open_settings).pack(side=tk.LEFT)
-        ttk.Button(row1, text="Rescan", command=self.rescan).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(top, text="Local copy:").grid(row=0, column=0, sticky=tk.W)
+        self.path_var = tk.StringVar()
+        ttk.Label(top, textvariable=self.path_var, foreground="#555", width=10).grid(
+            row=0, column=1, sticky=tk.EW, padx=(6, 12))
 
-        row2 = ttk.Frame(top)
-        row2.pack(side=tk.TOP, fill=tk.X, pady=(6, 0))
-        ttk.Label(row2, text="Device:").pack(side=tk.LEFT)
+        ttk.Label(top, text="Device:").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
         self.device_status_var = tk.StringVar(value="checking...")
-        self.device_status_label = ttk.Label(row2, textvariable=self.device_status_var)
-        self.device_status_label.pack(side=tk.LEFT, padx=(4, 12))
-        ttk.Button(row2, text="Pull from Phone", command=self.pull_from_phone).pack(side=tk.LEFT)
-        ttk.Button(row2, text="Push All Changed to Phone", command=self.push_all_changed).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(row2, text="Settings...", command=self.open_settings).pack(side=tk.LEFT, padx=(6, 0))
+        self.device_status_label = ttk.Label(top, textvariable=self.device_status_var, width=10)
+        self.device_status_label.grid(row=1, column=1, sticky=tk.EW, padx=(6, 12), pady=(4, 0))
 
+        actions = ttk.Frame(top)
+        actions.grid(row=0, column=2, rowspan=2, sticky=tk.E)
+        ttk.Button(actions, text="Rescan", command=self.rescan).pack(side=tk.LEFT, padx=2)
+        ttk.Button(actions, text="Pull from Phone", command=self.pull_from_phone).pack(side=tk.LEFT, padx=2)
+        ttk.Button(actions, text="Push All Changed", command=self.push_all_changed).pack(side=tk.LEFT, padx=2)
+        ttk.Button(actions, text="Settings...", command=self.open_settings).pack(side=tk.LEFT, padx=2)
 
+        self._set_path_display()
 
-        body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
-        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        # ---- body: mission list | details ----
+        self.body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        self.body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         # --- left: mission list ---
-        left = ttk.Frame(body, padding=(8, 4))
-        columns = ("flight", "label", "mission_file", "sync", "notes")
+        left = ttk.Frame(self.body, padding=(8, 4))
+        columns = ("flight", "label", "id", "sync", "notes")
         self.tree = ttk.Treeview(left, columns=columns, show="headings", selectmode="browse")
-        headings = {
-            "flight": "Flight #",
-            "label": "Label",
-            "mission_file": "Mission file",
-            "sync": "Sync",
-            "notes": "Notes",
+        spec = {
+            #  col      heading     width  minwidth stretch
+            "flight": ("Flight #", 60,  50,  False),
+            "label":  ("Label",    130, 70,  False),
+            "id":     ("ID",       80,  60,  False),
+            "sync":   ("Sync",     80,  60,  False),
+            "notes":  ("Notes",    120, 60,  True),
         }
-        widths = {"flight": 55, "label": 120, "mission_file": 150, "sync": 90, "notes": 140}
-        for col in columns:
-            self.tree.heading(col, text=headings[col])
-            self.tree.column(col, width=widths[col], anchor=tk.W)
+        for col, (text, width, minw, stretch) in spec.items():
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=width, minwidth=minw, stretch=stretch, anchor=tk.W)
 
         vsb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.LEFT, fill=tk.Y)
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
 
-        body.add(left, weight=3)
+        self.body.add(left, weight=2)
 
-        # --- right: details panel ---
-        
-        right = ttk.Frame(body, padding=(8, 4))
+        # --- right: details (grid so each section shrinks sensibly) ---
+        right = ttk.Frame(self.body, padding=(8, 4))
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=3, minsize=200)   # preview grows most
+        right.rowconfigure(1, weight=0)                # files: fixed height
+        right.rowconfigure(2, weight=1, minsize=150)   # tracking/notes
 
-        image_frame = ttk.LabelFrame(
-            right,
-            text="Thumbnail and Preview"
-        )
-        image_frame.pack(
-            side=tk.TOP,
-            fill=tk.BOTH,
-            expand=True,
-            pady=(0, 8)
-        )
+        # Preview: thumbnail + map
+        preview = ttk.LabelFrame(right, text="Thumbnail and Preview")
+        preview.grid(row=0, column=0, sticky=tk.NSEW, pady=(0, 6))
+        preview.columnconfigure(1, weight=1)
+        preview.rowconfigure(0, weight=1)
 
-        # Container for thumbnail + map
-        preview_frame = ttk.Frame(image_frame)
-        preview_frame.pack(
-            fill=tk.BOTH,
-            expand=True,
-            padx=8,
-            pady=8
-        )
+        thumb_box = ttk.Frame(preview, width=THUMB_BOX, height=THUMB_BOX, relief=tk.GROOVE)
+        thumb_box.grid(row=0, column=0, sticky=tk.N, padx=(6, 6), pady=6)
+        thumb_box.pack_propagate(False)
+        self.thumb_label = ttk.Label(thumb_box, text="(no thumbnail)", anchor=tk.CENTER)
+        self.thumb_label.pack(fill=tk.BOTH, expand=True)
 
-        # -------------------------
-        # Thumbnail - LEFT
-        # -------------------------
+        self.map_widget = TkinterMapView(preview, width=200, height=170, corner_radius=0)
+        self.map_widget.grid(row=0, column=1, sticky=tk.NSEW, padx=(0, 6), pady=6)
 
-        self.thumb_label = ttk.Label(
-            preview_frame,
-            text="(no thumbnail)",
-            anchor=tk.CENTER,
-            relief=tk.GROOVE,
-            width=30
-        )
-
-        self.thumb_label.pack(
-            side=tk.LEFT,
-            fill=tk.Y,
-            padx=(0, 8),
-            ipady=60
-        )
-
-        # -------------------------
-        # Map - RIGHT
-        # -------------------------
-
-        self.map_widget = TkinterMapView(
-            preview_frame,
-            corner_radius=0
-        )
-
-        self.map_widget.pack(
-            side=tk.LEFT,
-            fill=tk.BOTH,
-            expand=True
-        )
-        ### Files section (mission file and thumbnail file configuration)
-        
-        files_frame = ttk.LabelFrame(right, text="Files (managed by DJI Fly - names locked)")
-        files_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
+        # Files
+        files = ttk.LabelFrame(right, text="Files (managed by DJI Fly - names locked)")
+        files.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
+        files.columnconfigure(1, weight=1)
 
         self.mission_file_var = tk.StringVar()
         self.thumb_file_var = tk.StringVar()
@@ -649,114 +626,68 @@ class App(tk.Tk):
         self.thumb_marker_var = tk.StringVar()
         self.source_file_var = tk.StringVar()
 
+        def file_row(row, title, name_var, marker_var, buttons):
+            ttk.Label(files, text=title).grid(row=row, column=0, sticky=tk.W, padx=6, pady=3)
+            ttk.Label(files, textvariable=name_var, foreground="#333", width=10).grid(
+                row=row, column=1, sticky=tk.EW, padx=4)
+            ttk.Label(files, textvariable=marker_var, foreground="#b34700").grid(
+                row=row, column=2, sticky=tk.W, padx=2)
+            bf = ttk.Frame(files)
+            bf.grid(row=row, column=3, sticky=tk.E, padx=4)
+            for text, cmd in buttons:
+                ttk.Button(bf, text=text, width=9, command=cmd).pack(side=tk.LEFT, padx=2)
 
-        ### Mission file row and actions
-        ttk.Label(files_frame, text="Mission file:").grid(row=0, column=0, sticky=tk.W, padx=4, pady=2)
-        ttk.Label(files_frame, textvariable=self.mission_file_var, foreground="#333").grid(
-            row=0, column=1, sticky=tk.W, padx=4, pady=2)
-        ttk.Label(files_frame, textvariable=self.mission_marker_var, foreground="#b34700").grid(
-            row=0, column=2, sticky=tk.W, padx=2)
-        ttk.Button(files_frame, text="Build",
-                   command=lambda: self.build_file("mission")).grid(row=0, column=3, padx=3)
-        # ttk.Button(files_frame, text="Replace...",
-        #            command=lambda: self.replace_file("mission")).grid(row=0, column=3, padx=3)
-        ttk.Button(files_frame, text="Reveal",
-                   command=lambda: self.reveal_file("mission")).grid(row=0, column=5, padx=3)
+        file_row(0, "Mission:", self.mission_file_var, self.mission_marker_var, [
+            ("Build...", lambda: self.build_file("mission")),
+            ("Reveal", lambda: self.reveal_file("mission")),
+        ])
+        file_row(1, "Thumbnail:", self.thumb_file_var, self.thumb_marker_var, [
+            ("Replace...", lambda: self.replace_file("thumbnail")),
+            ("Reveal", lambda: self.reveal_file("thumbnail")),
+        ])
 
+        ttk.Label(files, text="Source CSV:").grid(row=2, column=0, sticky=tk.W, padx=6, pady=3)
+        ttk.Label(files, textvariable=self.source_file_var, foreground="#333", width=10).grid(
+            row=2, column=1, columnspan=3, sticky=tk.EW, padx=4)
 
-        ### Thumbnail row and actions
-        ttk.Label(files_frame, text="Thumbnail:").grid(row=1, column=0, sticky=tk.W, padx=4, pady=2)
-        ttk.Label(files_frame, textvariable=self.thumb_file_var, foreground="#333").grid(
-            row=1, column=1, sticky=tk.W, padx=4, pady=2)
-        ttk.Label(files_frame, textvariable=self.thumb_marker_var, foreground="#b34700").grid(
-            row=1, column=2, sticky=tk.W, padx=2)
-        ttk.Button(files_frame, text="Replace...",
-                   command=lambda: self.replace_file("thumbnail")).grid(row=1, column=3, padx=3)
-        ttk.Button(files_frame, text="Reveal",
-                   command=lambda: self.reveal_file("thumbnail")).grid(row=1, column=5, padx=3)
+        ttk.Button(files, text="Push this mission to phone", command=self.push_file).grid(
+            row=3, column=0, columnspan=4, sticky=tk.E, padx=6, pady=(2, 6))
 
-        ### ----- Display Mission file Source
-        source_frame = ttk.LabelFrame(
-            files_frame,
-            text="Mission Source"
-        )
-        source_frame.grid(
-            row=2,
-            column=0,
-            columnspan=6,
-            sticky=tk.EW,
-            padx=4,
-            pady=(6, 2)
-        )
+        # Tracking info
+        meta = ttk.LabelFrame(right, text="Your tracking info (local only - never pushed)")
+        meta.grid(row=2, column=0, sticky=tk.NSEW)
+        meta.columnconfigure(3, weight=1)
+        meta.rowconfigure(1, weight=1)
 
-        source_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(
-            source_frame,
-            text="CSV Mission file:"
-        ).grid(
-            row=0,
-            column=0,
-            sticky=tk.W,
-            padx=4,
-            pady=4
-        )
-
-        ttk.Label(
-            source_frame,
-            textvariable=self.source_file_var,
-            foreground="#333"
-        ).grid(
-            row=0,
-            column=1,
-            sticky=tk.EW,
-            padx=4,
-            pady=4
-        )
-        # Push button underneath
-        ttk.Button(
-            source_frame,
-            text="Push",
-            command=lambda: self.push_file()
-        ).grid(
-            row=1,
-            column=0,
-            columnspan=2,
-            pady=(4, 4)
-        )
-
-        ### Notes section (flight number, label, notes)
-
-        meta_frame = ttk.LabelFrame(right, text="Your tracking info (local only - never pushed to phone)")
-        meta_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        ttk.Label(meta_frame, text="Flight #:").grid(row=0, column=0, sticky=tk.W, padx=4, pady=4)
-        self.flight_entry = ttk.Entry(meta_frame, width=10)
+        ttk.Label(meta, text="Flight #:").grid(row=0, column=0, sticky=tk.W, padx=6, pady=4)
+        self.flight_entry = ttk.Entry(meta, width=8)
         self.flight_entry.grid(row=0, column=1, sticky=tk.W, padx=4, pady=4)
+        ttk.Label(meta, text="Label:").grid(row=0, column=2, sticky=tk.W, padx=(12, 4), pady=4)
+        self.label_entry = ttk.Entry(meta, width=10)
+        self.label_entry.grid(row=0, column=3, sticky=tk.EW, padx=(0, 6), pady=4)
 
-        ttk.Label(meta_frame, text="Label:").grid(row=1, column=0, sticky=tk.W, padx=4, pady=4)
-        self.label_entry = ttk.Entry(meta_frame, width=30)
-        self.label_entry.grid(row=1, column=1, sticky=tk.EW, padx=4, pady=4, columnspan=2)
+        ttk.Label(meta, text="Notes:").grid(row=1, column=0, sticky=tk.NW, padx=6, pady=4)
+        self.notes_text = tk.Text(meta, height=4, width=10, wrap=tk.WORD)
+        self.notes_text.grid(row=1, column=1, columnspan=3, sticky=tk.NSEW, padx=(4, 6), pady=4)
 
-        ttk.Label(meta_frame, text="Notes:").grid(row=2, column=0, sticky=tk.NW, padx=4, pady=4)
-        self.notes_text = tk.Text(meta_frame, height=8, width=30, wrap=tk.WORD)
-        self.notes_text.grid(row=2, column=1, sticky=tk.NSEW, padx=4, pady=4, columnspan=2)
+        ttk.Button(meta, text="Save", command=self.save_selected).grid(
+            row=2, column=0, columnspan=4, sticky=tk.E, padx=6, pady=(0, 6))
 
-        meta_frame.columnconfigure(1, weight=1)
-        meta_frame.rowconfigure(2, weight=1)
+        self.body.add(right, weight=3)
 
-        btn_row = ttk.Frame(right)
-        btn_row.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
-        ttk.Button(btn_row, text="Save", command=self.save_selected).pack(side=tk.RIGHT)
-
-        body.add(right, weight=2)
-
-        # --- status bar ---
-        self.status_var = tk.StringVar(value="Ready")
-        status = ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W, padding=(6, 2))
-        status.pack(side=tk.BOTTOM, fill=tk.X)
+        # Give the list ~42% of the width on first show.
+        self.after(150, self._set_initial_sash)
 
         self._set_details_enabled(False)
+
+    def _set_initial_sash(self):
+        try:
+            self.body.sashpos(0, int(self.winfo_width() * 0.42))
+        except tk.TclError:
+            pass
+
+    def _set_path_display(self):
+        self.path_var.set(shorten(self.cfg.get("local_root") or "(not set)", 70))
 
     def _set_details_enabled(self, enabled: bool):
         state = tk.NORMAL if enabled else tk.DISABLED
@@ -770,12 +701,12 @@ class App(tk.Tk):
         SettingsDialog(self, self.cfg, on_save=self._after_settings_saved)
 
     def _after_settings_saved(self):
-        self.path_var.set(self.cfg.get("local_root") or "(not set)")
+        self._set_path_display()
         self.rescan()
 
     def _poll_device_status(self):
         ready, message = device_status(self.cfg)
-        self.device_status_var.set(message)
+        self.device_status_var.set(shorten(message, 90))
         self.device_status_label.configure(foreground="#1a7a1a" if ready else "#a33")
         self.after(4000, self._poll_device_status)
 
@@ -805,16 +736,19 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         for m in self.missions:
             notes_preview = (m.meta.get("notes") or "").replace("\n", " ")
-            if len(notes_preview) > 40:
-                notes_preview = notes_preview[:37] + "..."
-            sync_text = "needs push" if m.needs_push() else ""
             self.tree.insert("", tk.END, iid=m.mission_id, values=(
                 m.meta.get("flight_number") or "",
                 m.meta.get("label") or "",
-                m.mission_file.name if m.mission_file else "(none)",
-                sync_text,
+                m.mission_id[:8],
+                "needs push" if m.needs_push() else "",
                 notes_preview,
             ))
+
+    def _reselect(self, m: Mission):
+        self._refresh_tree()
+        self.tree.selection_set(m.mission_id)
+        self.tree.see(m.mission_id)
+        self.on_select()
 
     def on_select(self, _event=None):
         sel = self.tree.selection()
@@ -834,7 +768,7 @@ class App(tk.Tk):
         self.thumb_file_var.set(m.thumbnail_file.name if m.thumbnail_file else "(none found)")
         self.mission_marker_var.set("needs push" if m.meta.get("mission_file_dirty") else "")
         self.thumb_marker_var.set("needs push" if m.meta.get("thumbnail_dirty") else "")
-        self.source_file_var.set(m.meta.get("source_csv") or "(none)")
+        self.source_file_var.set(shorten(m.meta.get("source_csv") or "(none)", 70))
 
         self.flight_entry.delete(0, tk.END)
         self.flight_entry.insert(0, m.meta.get("flight_number") or "")
@@ -861,195 +795,46 @@ class App(tk.Tk):
 
         try:
             img = Image.open(m.thumbnail_file)
-            img.thumbnail(THUMB_SIZE)
+            img.thumbnail((THUMB_BOX - 4, THUMB_BOX - 4))
             self._thumb_imgtk = ImageTk.PhotoImage(img)
             self.thumb_label.configure(image=self._thumb_imgtk, text="")
-        except Exception as exc:  # noqa: BLE001 - surface any load failure, not just PIL's own errors
-            self.thumb_label.configure(image="", text=f"(couldn't load image)\n{exc}")
+        except Exception as exc:  # noqa: BLE001
+            self.thumb_label.configure(image="", text="(couldn't load image)")
             self._thumb_imgtk = None
-
+            self.status_var.set(f"Thumbnail error: {exc}")
 
     def _update_map_preview(self, m: Mission):
-        """
-        Load a DJI Fly mission file (.kmz, .wpml or .kml) and display
-        the waypoint path on the tkinter map widget.
-        """
+        """Draw the mission's waypoint path on the map widget."""
+        self.map_widget.delete_all_marker()
+        self.map_widget.delete_all_path()
 
-        mission_file = Path(m.mission_file)
-
-        if not mission_file.exists() or not mission_file.is_file():
+        if not m.mission_file or not m.mission_file.is_file():
             return
 
         try:
-            # ---------------------------------------------------------
-            # 1. Load XML data
-            # ---------------------------------------------------------
-
-            suffix = mission_file.suffix.lower()
-
-            if suffix == ".kmz":
-                # KMZ is a ZIP archive
-                with zipfile.ZipFile(mission_file, "r") as kmz:
-
-                    # DJI KMZ files normally contain waylines.wpml
-                    wpml_files = [
-                        name for name in kmz.namelist()
-                        if name.lower().endswith((".wpml", ".kml"))
-                    ]
-
-                    if not wpml_files:
-                        raise ValueError(
-                            "No WPML or KML file found inside the KMZ"
-                        )
-
-                    # Prefer waylines.wpml if present
-                    mission_xml = next(
-                        (
-                            name for name in wpml_files
-                            if name.lower().endswith("waylines.wpml")
-                        ),
-                        wpml_files[0]
-                    )
-
-                    xml_data = kmz.read(mission_xml)
-
-            elif suffix in (".wpml", ".kml"):
-                # Already extracted XML
-                xml_data = mission_file.read_bytes()
-
-            else:
-                raise ValueError(
-                    f"Unsupported mission file type: {suffix}"
-                )
-
-            # ---------------------------------------------------------
-            # 2. Parse XML
-            # ---------------------------------------------------------
-
-            root = ET.fromstring(xml_data)
-
-            namespaces = {
-                "kml": "http://www.opengis.net/kml/2.2",
-                "wpml": "http://www.dji.com/wpmz/1.0.2",
-            }
-
-            # ---------------------------------------------------------
-            # 3. Extract DJI waypoint coordinates
-            # ---------------------------------------------------------
-
-            waypoints = []
-
-            placemarks = root.findall(
-                ".//kml:Placemark",
-                namespaces
-            )
-
-            for placemark in placemarks:
-
-                coordinates = placemark.find(
-                    ".//kml:Point/kml:coordinates",
-                    namespaces
-                )
-
-                if coordinates is None or not coordinates.text:
-                    continue
-
-                # KML format:
-                # longitude,latitude[,altitude]
-                parts = coordinates.text.strip().split(",")
-
-                if len(parts) < 2:
-                    continue
-
-                lon = float(parts[0])
-                lat = float(parts[1])
-
-                # Read DJI waypoint index if available
-                index_element = placemark.find(
-                    "wpml:index",
-                    namespaces
-                )
-
-                index = (
-                    int(index_element.text)
-                    if index_element is not None
-                    else len(waypoints)
-                )
-
-                waypoints.append({
-                    "index": index,
-                    "lat": lat,
-                    "lon": lon,
-                })
-
-            # Make sure waypoints are in mission order
-            waypoints.sort(key=lambda wp: wp["index"])
-
-            points = [
-                (wp["lat"], wp["lon"])
-                for wp in waypoints
-            ]
-
+            points = read_waypoints(m.mission_file)
             if not points:
                 raise ValueError("No waypoint coordinates found")
 
-            # ---------------------------------------------------------
-            # 4. Clear existing map objects if desired
-            # ---------------------------------------------------------
-
-            # Uncomment if your map widget supports it
-            self.map_widget.delete_all_marker()
-            self.map_widget.delete_all_path()
-
-            # ---------------------------------------------------------
-            # 5. Display the mission
-            # ---------------------------------------------------------
-
-            # Center on first waypoint
-            self.map_widget.set_position(
-                points[0][0],
-                points[0][1]
-            )
-
-            # Draw the flight path
             if len(points) > 1:
                 self.map_widget.set_path(points)
-
-            # Add numbered waypoint markers
-            # for i, (lat, lon) in enumerate(points):
-            #     self.map_widget.set_marker(
-            #         lat,
-            #         lon,
-            #         text=str(i)
-            #     )
-
-            # Optional: fit map to the complete mission
-            # if your tkintermapview version supports it:
-            #
-            # map_widget.fit_bounding_box(
-            #     (min(lat for lat, lon in points),
-            #      min(lon for lat, lon in points)),
-            #     (max(lat for lat, lon in points),
-            #      max(lon for lat, lon in points))
-            # )
+                lats = [p[0] for p in points]
+                lons = [p[1] for p in points]
+                try:
+                    self.map_widget.fit_bounding_box(
+                        (max(lats), min(lons)), (min(lats), max(lons)))
+                except Exception:  # noqa: BLE001 - widget not sized yet etc.
+                    self.map_widget.set_position(points[0][0], points[0][1])
+            else:
+                self.map_widget.set_position(points[0][0], points[0][1])
+                self.map_widget.set_zoom(17)
 
         except zipfile.BadZipFile:
-            messagebox.showerror(
-                "Error",
-                "The mission file is not a valid KMZ archive."
-            )
-
-        except ET.ParseError as e:
-            messagebox.showerror(
-                "Error",
-                f"Could not parse mission XML:\n{e}"
-            )
-
-        except Exception as e:
-            messagebox.showerror(
-                "Error",
-                str(e)
-            )
+            self.status_var.set("Map: the mission file is not a valid KMZ archive.")
+        except ET.ParseError as exc:
+            self.status_var.set(f"Map: could not parse mission XML ({exc})")
+        except Exception as exc:  # noqa: BLE001
+            self.status_var.set(f"Map: {exc}")
 
     # ---- notes -------------------------------------------------
 
@@ -1072,32 +857,41 @@ class App(tk.Tk):
         self.tree.see(m.mission_id)
         self.status_var.set(f"Saved notes for {m.mission_id}")
 
-    # ---- Waypoint Mission file actions -------------------------------------------
-    
+    # ---- Waypoint mission file actions ----------------------------------
+
     def build_file(self, kind: str):
         if not self.selected:
             return
         m = self.selected
         target = m.mission_file
-    
-        title = f"Choose replacement content for {target.name}"
-        source = filedialog.askopenfilename(title=title)
+        if target is None:
+            messagebox.showinfo(
+                "No mission file",
+                "This mission has no mission file for me to build into.\n"
+                "DJI Fly must create that file first.",
+            )
+            return
+
+        source = filedialog.askopenfilename(
+            title=f"Choose CSV to build {target.name} from",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
         if not source:
             return
         source_path = Path(source)
 
         if not messagebox.askyesno(
-            "Confirm replace",
+            "Confirm build",
             f"This will overwrite the CONTENTS of your LOCAL COPY of:\n\n  {target}\n\n"
-            f"with the contents of:\n\n  {source_path}\n\n"
+            f"with a mission built from:\n\n  {source_path}\n\n"
             "The filename stays exactly as it is, and nothing on the phone changes "
             "until you Push. Continue?",
         ):
             return
-        try:        
+        try:
             build_kmz_from_csv(source_path, target)
-        except OSError as exc:
-            messagebox.showerror("Replace failed", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Build failed", str(exc))
             return
 
         m.meta["mission_file_dirty"] = True
@@ -1107,11 +901,8 @@ class App(tk.Tk):
         except OSError as exc:
             messagebox.showerror("Save failed", str(exc))
 
-        self._refresh_tree()
-        self.tree.selection_set(m.mission_id)
-        self.on_select()
-        self.status_var.set(f"Replaced local contents of {target.name} - not yet pushed to phone")
-        
+        self._reselect(m)
+        self.status_var.set(f"Rebuilt local contents of {target.name} - not yet pushed")
 
     # ---- local file actions -------------------------------------------------
 
@@ -1141,8 +932,7 @@ class App(tk.Tk):
             )
             return
 
-        title = f"Choose replacement content for {target.name}"
-        source = filedialog.askopenfilename(title=title)
+        source = filedialog.askopenfilename(title=f"Choose replacement content for {target.name}")
         if not source:
             return
         source_path = Path(source)
@@ -1162,19 +952,14 @@ class App(tk.Tk):
             messagebox.showerror("Replace failed", str(exc))
             return
 
-        if kind == "mission":
-            m.meta["mission_file_dirty"] = True
-        else:
-            m.meta["thumbnail_dirty"] = True
+        m.meta["mission_file_dirty" if kind == "mission" else "thumbnail_dirty"] = True
         try:
             m.save_meta()
         except OSError as exc:
             messagebox.showerror("Save failed", str(exc))
 
-        self._refresh_tree()
-        self.tree.selection_set(m.mission_id)
-        self.on_select()
-        self.status_var.set(f"Replaced local contents of {target.name} - not yet pushed to phone")
+        self._reselect(m)
+        self.status_var.set(f"Replaced local contents of {target.name} - not yet pushed")
 
     # ---- sync actions -------------------------------------------------
 
@@ -1191,65 +976,46 @@ class App(tk.Tk):
         self.update_idletasks()
         success, message = pull_from_device(self.cfg)
         if success:
-            self.status_var.set(message)
             self.rescan()
+            self.status_var.set(message)
         else:
             self.status_var.set("Pull failed")
             messagebox.showerror("Pull from phone failed", message)
 
     def push_file(self):
+        """Push the selected mission's file (always) and thumbnail (if changed)."""
         if not self.selected:
             return
         m = self.selected
-        
+
         ready, message = device_status(self.cfg)
         if not ready:
             messagebox.showwarning("Device not ready", f"Can't reach the phone: {message}")
             return
 
-        # if m.meta["mission_file_dirty"] == True:
-        target = m.mission_file
-        kind = "mission"
+        jobs = []
+        if m.mission_file:
+            jobs.append((m.mission_file, "mission_file_dirty"))
+        if m.thumbnail_file and m.meta.get("thumbnail_dirty"):
+            jobs.append((m.thumbnail_file, "thumbnail_dirty"))
 
-        self.status_var.set(f"Pushing {target.name}...")
-        self.update_idletasks()
-        success, message = push_file_to_device(self.cfg, target)
-        if success:
-            if kind == "mission":
-                m.meta["mission_file_dirty"] = False
-            else:
-                m.meta["thumbnail_dirty"] = False
-            m.save_meta()
-            self._refresh_tree()
-            self.tree.selection_set(m.mission_id)
-            self.on_select()
-            self.status_var.set(message)
-        else:
-            self.status_var.set("Push failed")
-            messagebox.showerror("Push to phone failed", message)
-        
-        if m.meta["thumbnail_dirty"] == True:
-            target = m.thumbnail_file
-            kind = "thumbnail"
+        if not jobs:
+            messagebox.showinfo("Nothing to push", "This mission has no mission file to push.")
+            return
 
+        for target, dirty_key in jobs:
             self.status_var.set(f"Pushing {target.name}...")
             self.update_idletasks()
             success, message = push_file_to_device(self.cfg, target)
-            if success:
-                if kind == "mission":
-                    m.meta["mission_file_dirty"] = False
-                else:
-                    m.meta["thumbnail_dirty"] = False
-                m.save_meta()
-                self._refresh_tree()
-                self.tree.selection_set(m.mission_id)
-                self.on_select()
-                self.status_var.set(message)
-            else:
+            if not success:
                 self.status_var.set("Push failed")
                 messagebox.showerror("Push to phone failed", message)
+                return
+            m.meta[dirty_key] = False
+            m.save_meta()
+            self.status_var.set(message)
 
-
+        self._reselect(m)
 
     def push_all_changed(self):
         ready, message = device_status(self.cfg)
